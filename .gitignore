@@ -9,11 +9,6 @@
 *.test
 *.out
 
-# Specific service binaries (if built manually)
-generator
-processor
-gateway
-
 # --- Configuration & Secrets (CRITICAL) ---
 # Ignore .env files to prevent leaking secrets/ports to GitHub
 .env

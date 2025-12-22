@@ -39,17 +39,3 @@ gtw:
 # Tidy up Go modules
 deps:
 	go mod tidy
-
-# --- Debugging / Verification ---
-
-# Open a Redis CLI inside the container
-redis-cli:
-	docker exec -it redis redis-cli
-
-# Watch the Redis Pub/Sub channel in real-time
-watch-pubsub:
-	docker exec -it redis redis-cli subscribe prices.all
-
-# Check the latest Snapshot value for AAPL
-check-aapl:
-	docker exec -it redis redis-cli get stock:AAPL
