@@ -3,7 +3,7 @@ GENERATOR_SRC := cmd/generator/main.go
 PROCESSOR_SRC := cmd/processor/main.go
 GATEWAY_SRC := cmd/gateway/main.go
 
-.PHONY: up down restart logs gen proc deps clean redis-monitor
+.PHONY: up down restart logs gen proc deps clean
 
 # --- Infrastructure ---
 
@@ -20,7 +20,7 @@ restart: down up
 
 # View logs for the infrastructure (Kafka/Redis)
 logs:
-	docker-compose logs -f
+	docker-compose logs -f kafka1 kafka2 kafka3 redis
 
 # --- Application ---
 

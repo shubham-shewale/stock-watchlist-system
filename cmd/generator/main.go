@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"net"
 	"os"
@@ -18,52 +19,47 @@ import (
 )
 
 var (
-	tickers = []string{"AAPL", "GOOG", "TSLA", "AMZN"}
-	logger  *zap.Logger
+	logger *zap.Logger
 )
 
 func main() {
-	// 1. Initialize Zap Logger
-	var err error
-	logger, err = zap.NewProduction()
+	cfg, err := config.LoadConfig()
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Failed to load config: %v", err))
+	}
+
+	logger, err = config.NewLogger(cfg.Logger)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to initialize logger: %v", err))
 	}
 	defer logger.Sync()
 
-	// 2. Load Config
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		logger.Fatal("Failed to load config", zap.Error(err))
-	}
+	createTopic(cfg.Kafka.Brokers, cfg.Kafka.Topic)
 
-	// 3. Create Topic (Ensure it exists)
-	createTopic(cfg.Kafka.Brokers[0], cfg.Kafka.Topic)
-
-	// 4. Setup Kafka Writer (Production Tuning)
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:    cfg.Kafka.Topic,
 		Balancer: &kafka.LeastBytes{},
 		// Optimization: Send batches to reduce network IO
-		BatchSize:    100,                   // Send after 100 messages
-		BatchTimeout: 10 * time.Millisecond, // OR send after 10ms
-		Async:        true,                  // Write non-blocking (fire and forget handled by buffer)
+		BatchSize:    100,
+		BatchTimeout: 200 * time.Millisecond,
+		Compression:  kafka.Snappy,
+		Async:        true, // Non-blocking writes for high throughput
+		Completion: func(messages []kafka.Message, err error) {
+			if err != nil {
+				// Failed to deliver some messages, Broker down !!
+				logger.Error("Kafka Write Error", zap.Error(err))
+			}
+		},
 	}
 
-	// 5. Setup Shutdown Hook
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Local State
 	seqCounters := make(map[string]int64)
-	basePrices := map[string]float64{
-		"AAPL": 150.0, "GOOG": 2800.0, "TSLA": 700.0, "AMZN": 3400.0,
-	}
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	// 6. Main Generator Loop
 	go func() {
 		logger.Info("Generator Started", zap.Strings("brokers", cfg.Kafka.Brokers))
 
@@ -72,9 +68,9 @@ func main() {
 			case <-ctx.Done():
 				return
 			default:
-				symbol := tickers[r.Intn(len(tickers))]
+				symbol := cfg.Generator.Tickers[r.Intn(len(cfg.Generator.Tickers))]
 				fluctuation := (r.Float64() * 10) - 5
-				price := basePrices[symbol] + fluctuation
+				price := cfg.Generator.BasePrices[symbol] + fluctuation
 				seqCounters[symbol]++
 
 				update := models.StockUpdate{
@@ -90,17 +86,15 @@ func main() {
 					continue
 				}
 
-				// Write to Kafka (Async due to writer config)
 				err = writer.WriteMessages(ctx, kafka.Message{
-					Key:   []byte(symbol), // Key ensures partition ordering
+					Key:   []byte(symbol), // Key ensures partition ordering for scalability
 					Value: payload,
 				})
 
 				if err != nil {
-					logger.Error("Kafka Write Error", zap.Error(err))
+					logger.Error("Kafka Write Error", zap.Error(err), zap.String("symbol", symbol), zap.Float64("price", price))
 				} else {
-					// Debug level helps reduce log spam in production
-					logger.Debug("Sent update", zap.String("symbol", symbol), zap.Float64("price", price))
+					logger.Debug("Sent update", zap.String("symbol", symbol), zap.Float64("price", price), zap.Int64("seq_id", seqCounters[symbol]))
 				}
 
 				time.Sleep(100 * time.Millisecond)
@@ -108,12 +102,10 @@ func main() {
 		}
 	}()
 
-	// 7. Wait for Shutdown Signal
 	<-sigChan
 	logger.Info("Shutdown signal received")
-	cancel() // Stop the generation loop
+	cancel()
 
-	// 8. Flush Kafka Buffer (CRITICAL)
 	if err := writer.Close(); err != nil {
 		logger.Error("Error closing Kafka writer", zap.Error(err))
 	} else {
@@ -121,21 +113,34 @@ func main() {
 	}
 }
 
-func createTopic(brokerAddress, topicName string) {
-	conn, err := kafka.Dial("tcp", brokerAddress)
+func createTopic(brokers []string, topicName string) {
+	dialer := &kafka.Dialer{
+		Timeout:   10 * time.Second,
+		DualStack: true,
+	}
+	var conn *kafka.Conn
+	var err error
+	for _, addr := range brokers {
+		conn, err = dialer.DialContext(context.Background(), "tcp", addr)
+		if err == nil {
+			break
+		}
+	}
+
 	if err != nil {
-		logger.Warn("Failed to dial leader for topic creation", zap.Error(err))
+		logger.Warn("Failed to dial any broker for topic creation", zap.Error(err))
 		return
 	}
 	defer conn.Close()
 
 	controller, err := conn.Controller()
 	if err != nil {
-		logger.Warn("Failed to connect to controller", zap.Error(err))
+		logger.Warn("Failed to get controller", zap.Error(err))
 		return
 	}
 
-	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	controllerConn, err := dialer.DialContext(context.Background(), "tcp",
+		net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
 	if err != nil {
 		logger.Warn("Failed to dial controller", zap.Error(err))
 		return
@@ -144,12 +149,41 @@ func createTopic(brokerAddress, topicName string) {
 
 	topicConfigs := []kafka.TopicConfig{{
 		Topic:             topicName,
-		NumPartitions:     4, // Increased partitions for better concurrency
-		ReplicationFactor: 1,
+		NumPartitions:     4,
+		ReplicationFactor: 3,
 	}}
 
 	err = controllerConn.CreateTopics(topicConfigs...)
 	if err != nil {
-		logger.Debug("Topic creation info", zap.Error(err))
+		if checkErr, ok := err.(kafka.Error); ok && checkErr == kafka.TopicAlreadyExists {
+			logger.Info("Topic already exists", zap.String("topic", topicName))
+		} else {
+			logger.Warn("Failed to create topic", zap.Error(err))
+			return // If creation failed significantly, we should probably stop
+		}
+	} else {
+		logger.Info("Topic creation request sent", zap.String("topic", topicName))
 	}
+
+	logger.Info("Waiting for topic metadata to propagate...", zap.String("topic", topicName))
+
+	logger.Info("Waiting for topic to initialize...", zap.String("topic", topicName))
+
+	maxRetries := 15
+	for i := 0; i < maxRetries; i++ {
+		// We allow the loop to sleep first to give Kafka a moment
+		time.Sleep(1 * time.Second)
+
+		// We check partitions. If this returns success, the topic is known.
+		partitions, err := conn.ReadPartitions(topicName)
+
+		if err == nil && len(partitions) > 0 {
+			logger.Info("Topic is ready!", zap.String("topic", topicName), zap.Int("partitions", len(partitions)))
+			return
+		}
+
+		logger.Debug("Topic not ready yet, retrying...", zap.String("topic", topicName))
+	}
+
+	logger.Warn("Timed out waiting for topic creation. Writes might fail initially.", zap.String("topic", topicName))
 }

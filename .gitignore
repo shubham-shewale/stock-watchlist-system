@@ -13,7 +13,6 @@
 # Ignore .env files to prevent leaking secrets/ports to GitHub
 .env
 .env.local
-.env.*
 
 # --- Go Modules & Workspaces ---
 vendor/

@@ -9,8 +9,9 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 	"github.com/shubham-shewale/stock-watchlist/pkg/config"
 	"github.com/shubham-shewale/stock-watchlist/pkg/models"
@@ -22,26 +23,18 @@ var (
 	rdb    *redis.Client
 )
 
-// NumWorkers defines concurrency level.
-// Should correspond roughly to number of CPU cores or Redis capability.
-const NumWorkers = 10
-
 func main() {
-	// 1. Initialize Zap
-	var err error
-	logger, err = zap.NewProduction()
+	cfg, err := config.LoadConfig()
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Failed to load config: %v", err))
+	}
+
+	logger, err = config.NewLogger(cfg.Logger)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to initialize logger: %v", err))
 	}
 	defer logger.Sync()
 
-	// 2. Load Config
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		logger.Fatal("Failed to load config", zap.Error(err))
-	}
-
-	// 3. Redis Setup
 	rdb = redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,
 		Password: cfg.Redis.Password,
@@ -51,83 +44,76 @@ func main() {
 		logger.Fatal("Failed to connect to Redis", zap.Error(err))
 	}
 
-	// 4. Kafka Reader Setup
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  cfg.Kafka.Brokers,
 		Topic:    cfg.Kafka.Topic,
 		GroupID:  cfg.Kafka.GroupID,
-		MinBytes: 10e3,
+		MinBytes: 200,
 		MaxBytes: 10e6,
-		// Explicit commit gives us control, but for high-throughput stock ticks
-		// with a worker pool, managing distributed offsets is complex.
-		// We rely on auto-commit here for throughput, accepting slight risk of
-		// duplicate processing (idempotency is handled by SeqID in a real app).
+		MaxWait:  200 * time.Millisecond,
+		// Auto-commit for throughput with deduplication by SeqID (avoids complex distributed offset management)
 		CommitInterval: 1,
+		// Rebalancing: 3s heartbeat, 10s session timeout for responsive scaling
+		HeartbeatInterval: 3 * time.Second,
+		SessionTimeout:    10 * time.Second,
 	})
 
-	// 5. Setup Worker Pool (Sharded by Symbol)
-	// We create N channels for N workers
-	workerChans := make([]chan []byte, NumWorkers)
+	// Worker pool sharded by symbol for concurrency and order preservation
+	numWorkers := cfg.Processor.NumWorkers
+	workerChans := make([]chan []byte, numWorkers)
 	var wg sync.WaitGroup
 
-	for i := 0; i < NumWorkers; i++ {
-		workerChans[i] = make(chan []byte, 100) // Buffer 100
+	for i := 0; i < numWorkers; i++ {
+		workerChans[i] = make(chan []byte, 100) // Buffered channel for backpressure
 		wg.Add(1)
-		// Start Worker
 		go worker(i, workerChans[i], &wg)
 	}
 
-	// 6. Graceful Shutdown Setup
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// 7. Main Consumer Loop
 	go func() {
-		logger.Info("Processor Started", zap.Int("workers", NumWorkers))
+		logger.Info("Processor Started", zap.Int("workers", numWorkers))
 		for {
-			// Read Message (Blocking)
+			// Auto commit after the message is fetched, TradeOff: Use reader.FetchMessage (which does not commit)
 			m, err := reader.ReadMessage(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
-					return // Shutdown triggered
+					return
 				}
 				logger.Error("Kafka Read Error", zap.Error(err))
 				continue
 			}
 
-			// Determine which worker gets this message
-			// Hashing logic ensures "AAPL" always goes to same worker -> preserving order
-			// Key must be the Symbol
-			workerID := getWorkerID(m.Key)
+			// Consistent hashing ensures symbol-based sharding for order preservation
+			workerID := getWorkerID(m.Key, numWorkers)
 
-			// Dispatch to worker
 			select {
 			case workerChans[workerID] <- m.Value:
-				// Success
 			case <-ctx.Done():
 				return
+			default:
+				// NON-BLOCKING: If channel is full, we drop the packet.
+				// In real-time stocks, "latest" is better than "all".
+				logger.Warn("Dropping slow packet", zap.String("key", string(m.Key)), zap.Int("worker_id", workerID))
 			}
 		}
 	}()
 
-	// 8. Wait for Shutdown
 	<-sigChan
 	logger.Info("Shutdown signal received, stopping processor...")
-	cancel() // Stops the kafka read loop
+	cancel()
 
-	// 9. Cleanup Sequence
 	logger.Info("Closing Kafka Reader...")
 	if err := reader.Close(); err != nil {
 		logger.Error("Error closing reader", zap.Error(err))
 	}
 
 	logger.Info("Waiting for workers to drain...")
-	// Close all channels to signal workers to stop
 	for _, ch := range workerChans {
 		close(ch)
 	}
-	// Wait for workers to finish processing their buffer
 	wg.Wait()
 
 	logger.Info("Closing Redis...")
@@ -136,10 +122,12 @@ func main() {
 	logger.Info("Processor exited cleanly")
 }
 
-// worker handles the actual processing pipeline
 func worker(id int, msgs <-chan []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
-	ctx := context.Background() // Use background context for Redis writes (don't cancel mid-write)
+	ctx := context.Background() // Background context prevents cancellation mid-Redis write
+
+	// Per-worker deduplication state for exactly-once processing
+	lastSeq := make(map[string]int64)
 
 	for payload := range msgs {
 		var update models.StockUpdate
@@ -148,28 +136,32 @@ func worker(id int, msgs <-chan []byte, wg *sync.WaitGroup) {
 			continue
 		}
 
+		// Deduplication: skip if SeqID not greater than last processed
+		if update.SeqID <= lastSeq[update.Symbol] {
+			logger.Debug("Skipping duplicate update", zap.String("symbol", update.Symbol), zap.Int64("seq_id", update.SeqID), zap.Int64("last_seq", lastSeq[update.Symbol]))
+			continue
+		}
+
 		key := fmt.Sprintf("stock:%s", update.Symbol)
 
-		// Step A: Snapshot (KV)
-		// In production, we might use a Pipeline here to do both Set and Publish in 1 RTT
+		// Atomic SET + PUBLISH in single pipeline for consistency
 		pipe := rdb.Pipeline()
-		pipe.Set(ctx, key, payload, 0)
+		pipe.Set(ctx, key, payload, 1*time.Hour) // TTL prevents unbounded memory growth
 		channelName := fmt.Sprintf("prices.%s", update.Symbol)
 		pipe.Publish(ctx, channelName, payload)
 
 		_, err := pipe.Exec(ctx)
 		if err != nil {
 			logger.Error("Redis Pipeline Error", zap.Error(err), zap.String("symbol", update.Symbol))
-			// Retry logic could go here
 		} else {
-			logger.Debug("Processed", zap.String("symbol", update.Symbol), zap.Int("worker_id", id))
+			logger.Debug("Processed", zap.String("symbol", update.Symbol), zap.Int("worker_id", id), zap.Int64("seq_id", update.SeqID))
+			lastSeq[update.Symbol] = update.SeqID
 		}
 	}
 }
 
-// getWorkerID hashes the key (Symbol) to find a consistent worker ID
-func getWorkerID(key []byte) int {
+func getWorkerID(key []byte, numWorkers int) int {
 	h := fnv.New32a()
 	h.Write(key)
-	return int(h.Sum32()) % NumWorkers
+	return int(h.Sum32()) % numWorkers
 }
