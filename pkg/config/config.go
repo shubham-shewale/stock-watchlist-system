@@ -11,7 +11,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Config holds all configuration for the application
 type Config struct {
 	App       AppConfig       `mapstructure:"app"`
 	Redis     RedisConfig     `mapstructure:"redis"`
@@ -71,13 +70,11 @@ type TimeoutConfig struct {
 func LoadConfig() (*Config, error) {
 	v := viper.New()
 
-	// 1. Load .env file into System Environment (if it exists)
 	// This ensures variables like APP_PORT are available as real env vars
 	if err := godotenv.Load(); err != nil {
 		log.Println("Note: No .env file found, relying on System Env Vars")
 	}
 
-	// 2. Set Defaults (12-Factor App: Dev/Prod Parity)
 	v.SetDefault("app.port", ":8080")
 	v.SetDefault("app.env", "local")
 
@@ -107,12 +104,10 @@ func LoadConfig() (*Config, error) {
 	v.SetDefault("gateway.max_connections", 1000)
 	v.SetDefault("gateway.allowed_origins", []string{"*"})
 
-	// 3. Configure Viper to read Environment Variables
 	// This maps dot-notation to underscores (e.g., "app.port" -> "APP_PORT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
-	// 4. Explicitly Bind Env Vars to Keys
 	// This is crucial for Viper to map flat Env Vars (APP_PORT) to nested structs (App.Port)
 	bindEnv(v, "app.port", "app.env")
 	bindEnv(v, "redis.addr", "redis.password", "redis.db")
@@ -123,13 +118,11 @@ func LoadConfig() (*Config, error) {
 	bindEnv(v, "gateway.valid_tickers", "gateway.timeouts.write_wait", "gateway.timeouts.pong_wait", "gateway.timeouts.ping_period", "gateway.timeouts.send_buffer_size")
 	bindEnv(v, "gateway.max_connections", "gateway.allowed_origins")
 
-	// 5. Unmarshal into Struct
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unable to decode config into struct: %v", err)
 	}
 
-	// 6. Basic Validation
 	if len(cfg.Kafka.Brokers) == 0 {
 		return nil, fmt.Errorf("kafka brokers cannot be empty")
 	}
@@ -137,7 +130,6 @@ func LoadConfig() (*Config, error) {
 	return &cfg, nil
 }
 
-// bindEnv is a helper to bind multiple keys at once
 func bindEnv(v *viper.Viper, keys ...string) {
 	for _, key := range keys {
 		if err := v.BindEnv(key); err != nil {
@@ -146,7 +138,6 @@ func bindEnv(v *viper.Viper, keys ...string) {
 	}
 }
 
-// NewLogger creates a Zap logger based on the configuration
 func NewLogger(cfg LoggerConfig) (*zap.Logger, error) {
 	var config zap.Config
 

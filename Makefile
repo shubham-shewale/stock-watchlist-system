@@ -1,11 +1,8 @@
-# Builds
 GENERATOR_SRC := cmd/generator/main.go
 PROCESSOR_SRC := cmd/processor/main.go
 GATEWAY_SRC := cmd/gateway/main.go
 
-.PHONY: up down restart logs gen proc deps clean
-
-# --- Infrastructure ---
+.PHONY: up down restart logs gen proc deps
 
 # Start Kafka, Zookeeper, and Redis in the background
 up:
@@ -21,8 +18,6 @@ restart: down up
 # View logs for the infrastructure (Kafka/Redis)
 logs:
 	docker-compose logs -f kafka1 kafka2 kafka3 redis
-
-# --- Application ---
 
 # Run the Generator (Producer)
 gen:
