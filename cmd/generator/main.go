@@ -9,6 +9,7 @@ import (
 
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/compress"
+	"go.uber.org/zap"
 
 	"github.com/shubham-shewale/stock-watchlist/cmd/generator/internal/generator"
 	"github.com/shubham-shewale/stock-watchlist/pkg/config"
@@ -31,6 +32,12 @@ func main() {
 		Balancer:    &kafka.LeastBytes{},
 		Compression: compress.Snappy,
 		Async:       true,
+		Completion: func(messages []kafka.Message, err error) {
+			if err != nil {
+				// Failed to deliver some messages, Broker down !!
+				logger.Error("Kafka Write Error", zap.Error(err))
+			}
+		},
 	}
 
 	source := rand.NewSource(time.Now().UnixNano())

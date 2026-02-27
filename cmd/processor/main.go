@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof" // Enable pprof endpoints for profiling
 	"os/signal"
 	"syscall"
 	"time"
@@ -52,6 +54,14 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Start pprof server for profiling
+	go func() {
+		logger.Info("Starting pprof server on :6060")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			logger.Error("Pprof server error", zap.Error(err))
+		}
+	}()
 
 	if err := proc.Run(ctx); err != nil {
 		logger.Error("Processor Run Error", zap.Error(err))

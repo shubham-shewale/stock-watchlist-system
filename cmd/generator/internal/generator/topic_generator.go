@@ -58,7 +58,7 @@ func (tc *TopicCreator) Create(brokers []string, topicName string) {
 	err = controllerConn.CreateTopics(kafka.TopicConfig{
 		Topic:             topicName,
 		NumPartitions:     4,
-		ReplicationFactor: 1,
+		ReplicationFactor: 3,
 	})
 
 	if err != nil {

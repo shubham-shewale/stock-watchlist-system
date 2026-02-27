@@ -114,6 +114,11 @@ go build ./cmd/generator
 go build ./cmd/processor
 go build ./cmd/gateway
 
+# Profiling with pprof
+# Gateway pprof endpoints: http://localhost:8081/debug/pprof/
+# Processor pprof endpoints: http://localhost:6060/debug/pprof/
+# Use go tool pprof or web UI for analysis
+# Example: go tool pprof http://localhost:8081/debug/pprof/goroutine
 
 # Clean up
 make down
